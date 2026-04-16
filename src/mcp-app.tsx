@@ -1,5 +1,4 @@
-import { useApp } from "@modelcontextprotocol/ext-apps/react";
-import type { App } from "@modelcontextprotocol/ext-apps";
+import { App, PostMessageTransport } from "@modelcontextprotocol/ext-apps";
 import {  Excalidraw, exportToSvg, convertToExcalidrawElements, restore, CaptureUpdateAction, FONT_FAMILY, serializeAsJSON, MainMenu } from "@excalidraw/excalidraw";
 import morphdom from "morphdom";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -653,6 +652,7 @@ const excalidrawLogo = <svg
 
 
 export function ExcalidrawAppCore({ app }: { app: App }) {
+  const mainRef = useRef<HTMLElement | null>(null);
   const [toolInput, setToolInput] = useState<any>(null);
   const [inputIsFinal, setInputIsFinal] = useState(false);
   const [displayMode, setDisplayMode] = useState<"inline" | "fullscreen">("inline");
@@ -861,8 +861,50 @@ export function ExcalidrawAppCore({ app }: { app: App }) {
     }
   }, [displayMode, isNarrow, safeAreaInsets]);
 
+  // The SDK's default auto-resize shrink-wraps the root with `fit-content`, which
+  // mismeasures this app because the inline layout is mostly percentage-based.
+  // Report height only from the actual rendered root and leave width under host control.
+  useEffect(() => {
+    if (displayMode !== "inline" || !mainRef.current) return;
+
+    let raf = 0;
+    let lastHeight = -1;
+    const notifySize = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        const main = mainRef.current;
+        if (!main) return;
+        const height = Math.ceil(main.getBoundingClientRect().height);
+        if (height <= 0 || height === lastHeight) return;
+        lastHeight = height;
+        try {
+          app.sendSizeChanged({ height });
+          fsLog(`size-changed height=${height}`);
+        } catch (err) {
+          fsLog(`size-changed FAILED: ${err}`);
+        }
+      });
+    };
+
+    notifySize();
+    const observer = new ResizeObserver(() => notifySize());
+    observer.observe(mainRef.current);
+    window.addEventListener("resize", notifySize);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", notifySize);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [app, displayMode, editorSettled]);
+
   return (
-    <main className={`main${displayMode === "fullscreen" ? " fullscreen" : ""}`} style={displayMode === "fullscreen" && containerHeight ? { height: containerHeight } : undefined}>
+    <main
+      ref={mainRef}
+      className={`main${displayMode === "fullscreen" ? " fullscreen" : ""}`}
+      style={displayMode === "fullscreen" && containerHeight ? { height: containerHeight } : undefined}
+    >
       {displayMode === "inline" && (
         <div className="toolbar">
           <ShareButton
@@ -995,10 +1037,39 @@ export function ExcalidrawAppCore({ app }: { app: App }) {
 }
 
 export function ExcalidrawApp() {
-  const { app, error } = useApp({
-    appInfo: { name: "Excalidraw", version: "1.0.0" },
-    capabilities: {},
-  });
+  const [app, setApp] = useState<App | null>(null);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const appInstance = new App(
+      { name: "Excalidraw", version: "1.0.0" },
+      {},
+      { autoResize: false },
+    );
+
+    (async () => {
+      try {
+        const transport = new PostMessageTransport(window.parent, window.parent);
+        await appInstance.connect(transport);
+        if (!active) {
+          await appInstance.close();
+          return;
+        }
+        setApp(appInstance);
+        setError(null);
+      } catch (err) {
+        if (!active) return;
+        setApp(null);
+        setError(err instanceof Error ? err : new Error("Failed to connect"));
+      }
+    })();
+
+    return () => {
+      active = false;
+      void appInstance.close();
+    };
+  }, []);
 
   if (error) return <div className="error">ERROR: {error.message}</div>;
   if (!app) return <div className="loading">Connecting...</div>;
